@@ -130,6 +130,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         # fp16 and fp32 params for mixed precision training
         self._fp16_param_groups = dict()
         self._fp32_flat_param_groups_of_current_rank = dict()
+        self._fp32_param_groups_of_current_rank = []
 
         # communication params
         # self._overlap_communication = overlap_communication
@@ -210,19 +211,41 @@ class HybridZeroOptimizer(BaseOptimizer):
             # create a copy of fp32 weights of the parameters for which this rank is responsible
             # No flat fp32 buffer is allocated if the process has no parameters.
             if self.param_group_has_params[group_id]:
-                fp16_flat_current_rank = self._param_store.get_flat_fp16_param_by_rank_group(
-                    self._zero_local_rank, group_id
-                )
-                fp32_flat_current_rank = fp16_flat_current_rank.float()
+                fp32_params = []
+                fp16_params = self._param_store.get_fp16_params_by_rank_group(self._zero_local_rank, group_id)
                 device = "cpu" if self._cpu_offload else get_current_device()
-                fp32_flat_current_rank = fp32_flat_current_rank.to(device)
-                fp32_flat_current_rank.requires_grad = True
-                self._fp32_flat_param_groups_of_current_rank[group_id] = fp32_flat_current_rank
+                for param in fp16_params:
+                    with torch.no_grad():
+                        fp32_param = param.to(device=device, dtype=torch.float32)
+                    fp32_param.requires_grad = True
+                    fp32_params.append(fp32_param)
 
-                # need to replace the params in the `params` field in the optimizer
-                # so that when the optimizer calls step(), it only updates the tensors
-                # managed by this data parallel rank
-                param_group["params"] = [fp32_flat_current_rank]
+                # 1
+                with torch.no_grad():
+                    flat_fp32_param = flatten(fp32_params)
+                flat_fp32_param = flat_fp32_param.data.cuda()
+                sync_param(flat_tensor=flat_fp32_param, tensor_list=fp32_params)
+
+                # 2
+                param_group["params"] = fp32_params
+                self._fp32_param_groups_of_current_rank.append(fp32_params)
+                self._fp32_flat_param_groups_of_current_rank[group_id] = flat_fp32_param
+
+            # if self.param_group_has_params[group_id]:
+            #     fp16_flat_current_rank = self._param_store.get_flat_fp16_param_by_rank_group(
+            #         self._zero_local_rank, group_id
+            #     )
+            #     fp32_flat_current_rank = fp16_flat_current_rank.float()
+            #     device = "cpu" if self._cpu_offload else get_current_device()
+            #     fp32_flat_current_rank = fp32_flat_current_rank.to(device)
+            #     fp32_flat_current_rank.requires_grad = True
+            #     self._fp32_flat_param_groups_of_current_rank[group_id] = fp32_flat_current_rank
+
+            #     # need to replace the params in the `params` field in the optimizer
+            #     # so that when the optimizer calls step(), it only updates the tensors
+            #     # managed by this data parallel rank
+            #     # param_group["params"] = [fp32_flat_current_rank]
+            #     param_group["params"] = self._param_store.get_fp16_params_by_rank_group(self._zero_local_rank, group_id)
 
             # set reduction state
             for param in self._fp16_param_groups[group_id]:
@@ -611,31 +634,44 @@ class HybridZeroOptimizer(BaseOptimizer):
 
         # copy the grad of fp16 param to fp32 param
         single_grad_partition_groups = []
+        # for group_id in range(self.num_param_groups):
+        #     # compute norm
+        #     # The following operations are performed only on the rank to which parameters are assigned.
+        #     if not self.param_group_has_params[group_id]:
+        #         continue
+
+        #     # create flat gradient for the flat fp32 params
+        #     gradients = self._grad_store.get_averaged_gradients_by_group(group_id)
+        #     with torch.no_grad():
+        #         flat_fp16_avg_grads = flatten(gradients)
+        #     self._grad_store.reset_average_gradients_by_group(group_id)
+        #     gradients = None  # release cuda memory
+
+        #     dtype = self._fp32_flat_param_groups_of_current_rank[group_id].dtype
+        #     flat_fp32_avg_grads = flat_fp16_avg_grads.to(dtype)
+        #     flat_fp16_avg_grads = None  # release cuda memory
+
+        #     param_shape = self._fp32_flat_param_groups_of_current_rank[group_id].shape
+        #     assert (
+        #         param_shape == flat_fp32_avg_grads.shape
+        #     ), f"fp32 param and grad have different shape {param_shape} vs {flat_fp32_avg_grads.shape}"
+
+        #     single_grad_partition_groups.append(flat_fp32_avg_grads)
+        #     device = self._fp32_flat_param_groups_of_current_rank[group_id].device
+        #     self._fp32_flat_param_groups_of_current_rank[group_id].grad = flat_fp32_avg_grads.to(device)
         for group_id in range(self.num_param_groups):
-            # compute norm
-            # The following operations are performed only on the rank to which parameters are assigned.
             if not self.param_group_has_params[group_id]:
                 continue
 
-            # create flat gradient for the flat fp32 params
             gradients = self._grad_store.get_averaged_gradients_by_group(group_id)
-            with torch.no_grad():
-                flat_fp16_avg_grads = flatten(gradients)
             self._grad_store.reset_average_gradients_by_group(group_id)
-            gradients = None  # release cuda memory
+            fp32_params = self._fp32_param_groups_of_current_rank[group_id]
 
-            dtype = self._fp32_flat_param_groups_of_current_rank[group_id].dtype
-            flat_fp32_avg_grads = flat_fp16_avg_grads.to(dtype)
-            flat_fp16_avg_grads = None  # release cuda memory
-
-            param_shape = self._fp32_flat_param_groups_of_current_rank[group_id].shape
-            assert (
-                param_shape == flat_fp32_avg_grads.shape
-            ), f"fp32 param and grad have different shape {param_shape} vs {flat_fp32_avg_grads.shape}"
-
-            single_grad_partition_groups.append(flat_fp32_avg_grads)
-            device = self._fp32_flat_param_groups_of_current_rank[group_id].device
-            self._fp32_flat_param_groups_of_current_rank[group_id].grad = flat_fp32_avg_grads.to(device)
+            for idx, grad in enumerate(gradients):
+                fp32_grad = grad.float()
+                assert fp32_grad.shape == fp32_params[idx].shape
+                fp32_params[idx].grad = fp32_grad
+            gradients = None
 
         # unscale and clip grads
         # get the global norm
@@ -644,14 +680,14 @@ class HybridZeroOptimizer(BaseOptimizer):
             for group_name, norm in norms.items():
                 global_norm_groups[group_name] = norm**0.5
 
-        # the following operations are performed only on the rank to which parameters are assigned.
-        if gpc.config.model.dtype is not torch.float32:
-            if len(single_grad_partition_groups) != 0 and self._clip_grad_norm > 0:
-                self._unscale_and_clip_grads(
-                    single_grad_partition_groups,
-                    list(global_norm_groups.values()),
-                    loss_scale,
-                )
+        # # the following operations are performed only on the rank to which parameters are assigned.
+        # if gpc.config.model.dtype is not torch.float32:
+        #     if len(single_grad_partition_groups) != 0 and self._clip_grad_norm > 0:
+        #         self._unscale_and_clip_grads(
+        #             single_grad_partition_groups,
+        #             list(global_norm_groups.values()),
+        #             loss_scale,
+        #         )
 
         # update the parameters
         timer("step").start()
@@ -661,9 +697,11 @@ class HybridZeroOptimizer(BaseOptimizer):
         if self.has_params:
             self.optim.step()
             # release the fp32 grad
-            release_param_grad(self._fp32_flat_param_groups_of_current_rank.values())
+            # release_param_grad(self._fp32_flat_param_groups_of_current_rank.values())
             # update fp16 partition updated by the current rank
             for group_id in range(len(self._fp16_param_groups)):
+                release_param_grad(self._fp32_param_groups_of_current_rank[group_id])
+
                 if self.param_group_has_params[group_id]:
                     fp16_param = self._param_store.get_flat_fp16_param_by_rank_group(
                         rank=self._zero_local_rank, group_id=group_id

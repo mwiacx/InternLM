@@ -172,7 +172,7 @@ def main(args):
     )
 
     # initialize simple memory profiler
-    if args.profiling:
+    if not args.profiling:
         memory_profiler = SimpleMemoryProfiler(
             model,
             optimizer.optim,
@@ -224,9 +224,26 @@ def main(args):
             )
             timer("fwd-bwd").stop()
 
+            rank_str = (
+                f"rank{gpc.get_global_rank()}"
+                + f"_dp{gpc.get_local_rank(ParallelMode.DATA)}"
+                + f"_pp{gpc.get_local_rank(ParallelMode.PIPELINE)}"
+                + f"_tp{gpc.get_local_rank(ParallelMode.TENSOR)}"
+            )
+            torch.cuda.reset_peak_memory_stats()
+            print(
+                f"[{rank_str}] before allocated: {torch.cuda.memory_allocated() / 1024 / 1024}, max: {torch.cuda.max_memory_allocated() / 1024 / 1024}",
+                flush=True,
+            )
+
             # update parameters, and returns (success_update, grad_norm)
             trainer_result = trainer.step()
             assert trainer_result is not None
+
+            print(
+                f"[{rank_str}] after allocated: {torch.cuda.memory_allocated() / 1024 / 1024}, max: {torch.cuda.max_memory_allocated() / 1024 / 1024}",
+                flush=True,
+            )
 
             success_update, grad_norm_groups = trainer_result
             if success_update:  # update parameters successfully
